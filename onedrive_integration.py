@@ -176,17 +176,19 @@ def convert_dates(date_series):
 
 @st.cache_data
 def load_combined_data(sqlite_file_id):
-    """Načte a spojí data z obou zdrojů"""
+    """Načte a spojí data z obou zdrojů - OPRAVENÁ LOGIKA"""
     all_data = pd.DataFrame()
     
     # SQLite z Google Drive
     if sqlite_file_id:
+        st.write("🔄 Načítám SQLite z Google Drive...")
         sqlite_df = load_sqlite_from_google_drive(sqlite_file_id)
         if not sqlite_df.empty:
             all_data = pd.concat([all_data, sqlite_df], ignore_index=True)
     
-    # Excel z OneDrive
-    excel_df = load_excel_from_onedrive()
+    # Excel z OneDrive (POZOR: ne z Google Drive!)
+    st.write("🔄 Načítám Excel z OneDrive...")
+    excel_df = load_excel_from_onedrive()  # SPRÁVNÁ FUNKCE
     if not excel_df.empty:
         all_data = pd.concat([all_data, excel_df], ignore_index=True)
     
@@ -500,6 +502,19 @@ def main():
         st.header("📊 Dashboard")
         
         if st.button("🚀 Načíst data z obou zdrojů", type="primary"):
+            st.info("📊 **Hybrid načítání**: SQLite (Google Drive) + Excel (OneDrive)")
+            
+            with st.container():
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("🔄 **Zdroj 1: SQLite z Google Drive**")
+                    st.code(f"File ID: {st.session_state.sqlite_file_id}")
+                
+                with col2:
+                    st.write("🔄 **Zdroj 2: Excel z OneDrive**")
+                    st.code("OneDrive URL (automaticky)")
+            
             df = load_combined_data(st.session_state.sqlite_file_id)
             
             if df.empty:
