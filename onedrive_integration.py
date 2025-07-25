@@ -108,9 +108,10 @@ def setup_google_drive():
     with col1:
         st.write("**📊 SQLite databáze:**")
         sqlite_input = st.text_input(
-            "Google Drive link nebo File ID:",
+            "SQLite Google Drive link:",
             placeholder="https://drive.google.com/file/d/1BxiMVs... nebo přímo ID",
-            help="Celý Google Drive link nebo jen file ID"
+            help="Celý Google Drive link nebo jen file ID pro SQLite",
+            key="sqlite_input"
         )
         
         sqlite_file_id = None
@@ -123,9 +124,10 @@ def setup_google_drive():
     with col2:
         st.write("**📈 Excel soubor:**")
         excel_input = st.text_input(
-            "Google Drive link nebo File ID:",
+            "Excel Google Drive link:",
             placeholder="https://drive.google.com/file/d/1BxiMVs... nebo přímo ID",
-            help="Celý Google Drive link nebo jen file ID"
+            help="Celý Google Drive link nebo jen file ID pro Excel",
+            key="excel_input"
         )
         
         excel_file_id = None
