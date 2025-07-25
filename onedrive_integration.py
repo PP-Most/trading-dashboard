@@ -1,9 +1,7 @@
 """
-Trading Portfolio Dashboard - Combined Sources (OneDrive)
-========================================================
-Analýza výkonnosti trading strategií z SQLite + Excel z OneDrive
-
-Cloud verze s OneDrive integrací
+Trading Portfolio Dashboard - Google Drive Solution
+==================================================
+Google Drive je spolehlivější pro binární soubory než OneDrive
 """
 
 import streamlit as st
@@ -15,6 +13,7 @@ import os
 import requests
 import tempfile
 import io
+import re
 
 # Konfigurace
 st.set_page_config(
@@ -23,254 +22,161 @@ st.set_page_config(
     layout="wide"
 )
 
-# OneDrive URLs - NAKONFIGUROVAT TYTO LINKY
-SQLITE_ONEDRIVE_URL = "YOUR_SQLITE_ONEDRIVE_URL_HERE"  # Link na tradebook.db3
-EXCEL_ONEDRIVE_URL = "YOUR_EXCEL_ONEDRIVE_URL_HERE"    # Link na portfolio_k_30012024_new.xlsx
+# Google Drive - nahraďte YOUR_FILE_ID skutečným ID
+SQLITE_GDRIVE_ID = "YOUR_SQLITE_GDRIVE_FILE_ID"  # ID z Google Drive linku
+EXCEL_GDRIVE_ID = "YOUR_EXCEL_GDRIVE_FILE_ID"    # ID z Google Drive linku
+
+# OneDrive fallback
+EXCEL_ONEDRIVE_URL = "https://1drv.ms/x/c/1E57DA124B7D1AC2/EclafUsS2lcggB6gUwiAAAABuX9tM0jgj1UUoSBDHmp_FA?e=SYk93C&download=1"
+
 INITIAL_CAPITAL = 50000
 
-# Session state pro URL
-if 'sqlite_url' not in st.session_state:
-    st.session_state.sqlite_url = SQLITE_ONEDRIVE_URL
+def extract_google_drive_id(url):
+    """Extrahuje file ID z Google Drive URL"""
+    patterns = [
+        r'/file/d/([a-zA-Z0-9-_]+)',
+        r'id=([a-zA-Z0-9-_]+)',
+        r'/open\?id=([a-zA-Z0-9-_]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
 
-if 'excel_url' not in st.session_state:
-    st.session_state.excel_url = EXCEL_ONEDRIVE_URL
-
-def convert_onedrive_url_to_direct(share_url):
-    """Konvertuje OneDrive share URL na direct download URL"""
+def download_from_google_drive(file_id, file_type="file"):
+    """Stáhne soubor z Google Drive"""
     try:
-        if "1drv.ms" in share_url:
-            if "?" in share_url:
-                direct_url = share_url + "&download=1"
-            else:
-                direct_url = share_url + "?download=1"
-            return direct_url
-        elif "onedrive.live.com" in share_url:
-            direct_url = share_url.replace("redir?", "download?")
-            return direct_url
-        elif "sharepoint.com" in share_url or "-my.sharepoint.com" in share_url:
-            if "?" in share_url:
-                direct_url = share_url + "&download=1"
-            else:
-                direct_url = share_url + "?download=1"
-            return direct_url
-        return share_url
-    except Exception as e:
-        st.error(f"Chyba při konverzi URL: {e}")
-        return share_url
-
-def download_file_from_onedrive(url, file_type="unknown"):
-    """Stáhne soubor z OneDrive"""
-    try:
-        direct_url = convert_onedrive_url_to_direct(url)
+        # Google Drive direct download URL
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
         
-        with st.spinner(f"Stahuji {file_type} soubor z OneDrive..."):
-            response = requests.get(direct_url, stream=True, timeout=30)
+        with st.spinner(f"Stahuji {file_type} z Google Drive..."):
+            session = requests.Session()
+            response = session.get(download_url, stream=True)
+            
+            # Pro větší soubory může Google vyžadovat confirmation
+            if "virus scan warning" in response.text.lower() or len(response.content) < 1000:
+                # Najít confirmation token
+                for line in response.text.split('\n'):
+                    if 'confirm=' in line and 'download' in line:
+                        # Extrahovat token
+                        start = line.find('confirm=') + 8
+                        end = line.find('&', start)
+                        if end == -1:
+                            end = line.find('"', start)
+                        if end != -1:
+                            confirm_token = line[start:end]
+                            download_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
+                            response = session.get(download_url, stream=True)
+                            break
+            
             response.raise_for_status()
             
-            # Zkontrolovat, že se nestahuje HTML
-            if response.content.startswith(b'<!DOCTYPE') or b'<html' in response.content[:500]:
-                st.error(f"❌ {file_type}: OneDrive vrací HTML místo souboru. Zkontrolujte oprávnění.")
+            # Zkontrolovat content-type
+            content_type = response.headers.get('content-type', '')
+            if 'html' in content_type.lower() and file_type == "SQLite":
+                st.error(f"❌ {file_type}: Google Drive vrací HTML místo souboru")
                 return None
-                
+            
             return response.content
             
     except Exception as e:
-        st.error(f"Chyba při stahování {file_type}: {e}")
+        st.error(f"Chyba při stahování {file_type} z Google Drive: {e}")
         return None
 
-def convert_to_date_only(date_series):
-    """Konverze datetime na datum bez času - s filtrováním neplatných dat"""
-    print(f"\n=== KONVERZE DATUMŮ ===")
-    print(f"Celkem řádků k zpracování: {len(date_series)}")
-    print(f"Ukázka původních hodnot: {date_series.head().tolist()}")
+def setup_google_drive():
+    """Konfigurace Google Drive file IDs"""
+    st.subheader("🔧 Konfigurace Google Drive")
     
-    # Předčištění dat - odstranění timezone před konverzí
-    cleaned_series = date_series.copy()
-    
-    # Konverze na string a čištění timezone značek
-    cleaned_values = []
-    problematic_found = []
-    
-    for i, val in enumerate(cleaned_series):
-        try:
-            if pd.isna(val) or val == '' or str(val).strip() == '':
-                cleaned_values.append(None)
-                continue
-                
-            date_str = str(val).strip()
-            
-            # Detekce roku 1900 - problematické data
-            if '1900-' in date_str:
-                print(f"ODSTRAŇUJI problematické datum roku 1900 v řádku {i}: '{date_str}'")
-                problematic_found.append((i, date_str))
-                cleaned_values.append(None)
-                continue
-            
-            # Odstranění timezone značek
-            if '+' in date_str:
-                date_str = date_str.split('+')[0]
-            elif '-' in date_str and date_str.count('-') > 2:  # Má timezone s minus
-                parts = date_str.split('-')
-                if len(parts) > 3:  # YYYY-MM-DD-HH:MM nebo podobné
-                    date_str = '-'.join(parts[:3])  # Zachovat jen YYYY-MM-DD
-            if date_str.endswith('Z'):
-                date_str = date_str[:-1]
-            
-            # Odstranit čas - vzít jen datum část
-            if ' ' in date_str:
-                date_str = date_str.split(' ')[0]
-            
-            cleaned_values.append(date_str)
-            
-        except Exception as e:
-            print(f"Chyba při čištění řádku {i}: '{val}' -> {e}")
-            problematic_found.append((i, val))
-            cleaned_values.append(None)
-    
-    print(f"Předčištění dokončeno. Problematických řádků: {len(problematic_found)}")
-    
-    # Nyní konverze vyčištěných dat
-    try:
-        # Konverze s UTC=True pro potlačení timezone warning
-        result = pd.to_datetime(cleaned_values, errors='coerce', utc=True)
-        
-        # Odstranit timezone a převést na lokální čas
-        if hasattr(result.dtype, 'tz') and result.dtype.tz is not None:
-            result = result.dt.tz_localize(None)
-        
-        # Převést na datum pouze (odstranit čas)
-        result = result.dt.date
-        result = pd.to_datetime(result, errors='coerce')
-        
-        # Filtrovat data mimo rozumný rozsah (2020-2030)
-        date_range_mask = (result >= pd.Timestamp('2020-01-01')) & (result <= pd.Timestamp('2030-12-31'))
-        result = result.where(date_range_mask, pd.NaT)
-        
-        valid_count = result.notna().sum()
-        print(f"Konverze dokončena. Platných datumů: {valid_count}/{len(result)}")
-        if valid_count > 0:
-            print(f"Rozsah datumů: {result.min()} až {result.max()}")
-        
-        return result
-        
-    except Exception as e:
-        print(f"Chyba v konverzi datumů: {e}")
-        print("Spouštím manuální fallback...")
-        
-        # Manuální fallback
-        final_dates = []
-        for i, cleaned_val in enumerate(cleaned_values):
-            try:
-                if cleaned_val is None or cleaned_val == '':
-                    final_dates.append(pd.NaT)
-                else:
-                    # Pokus o manuální parsování
-                    parsed = pd.to_datetime(cleaned_val, errors='coerce')
-                    
-                    # Kontrola platnosti
-                    if (pd.notna(parsed) and 
-                        pd.Timestamp('2020-01-01') <= parsed <= pd.Timestamp('2030-12-31')):
-                        final_dates.append(parsed.date())
-                    else:
-                        final_dates.append(pd.NaT)
-                        
-            except Exception:
-                final_dates.append(pd.NaT)
-        
-        result = pd.Series([pd.to_datetime(d) if pd.notna(d) else pd.NaT for d in final_dates])
-        valid_count = result.notna().sum()
-        print(f"Fallback konverze dokončena. Platných datumů: {valid_count}/{len(result)}")
-        
-        return result
-
-def setup_onedrive_urls():
-    """Konfigurace OneDrive URL"""
-    st.subheader("🔧 Konfigurace OneDrive zdrojů")
-    
-    with st.expander("📋 Jak získat OneDrive linky", expanded=True):
+    with st.expander("📋 Jak získat Google Drive file ID", expanded=True):
         st.markdown("""
-        **Pro oba soubory (SQLite i Excel):**
-        1. **Jděte na** [onedrive.live.com](https://onedrive.live.com)
-        2. **Najděte soubor** (tradebook.db3 a portfolio_k_30012024_new.xlsx)
-        3. **Klikněte na tři tečky** (...) vedle souboru
-        4. **Vyberte "Share"**
-        5. **Nastavte "Anyone with the link can view"**
-        6. **Zkopírujte celý URL**
+        **Postup pro oba soubory:**
+        
+        1. **Nahrajte soubory na Google Drive**
+        2. **Pravý klik na soubor** → "Get link" 
+        3. **Změňte na "Anyone with the link can view"**
+        4. **Zkopírujte link** - vypadá takto:
+           ```
+           https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing
+           ```
+        5. **File ID** je část mezi `/d/` a `/view`: `1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs`
         """)
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.write("**📊 SQLite databáze (tradebook.db3):**")
-        sqlite_url = st.text_input(
-            "OneDrive URL pro SQLite:",
-            value=st.session_state.sqlite_url if st.session_state.sqlite_url != "YOUR_SQLITE_ONEDRIVE_URL_HERE" else "",
-            placeholder="https://1drv.ms/u/s!...",
-            help="Link na tradebook.db3 soubor"
+        st.write("**📊 SQLite databáze:**")
+        sqlite_input = st.text_input(
+            "Google Drive link nebo File ID:",
+            placeholder="https://drive.google.com/file/d/1BxiMVs... nebo přímo ID",
+            help="Celý Google Drive link nebo jen file ID"
         )
         
-        if sqlite_url != st.session_state.sqlite_url:
-            st.session_state.sqlite_url = sqlite_url
+        sqlite_file_id = None
+        if sqlite_input:
+            # Zkusit extrahovat ID z URL nebo použít přímo
+            extracted_id = extract_google_drive_id(sqlite_input)
+            sqlite_file_id = extracted_id if extracted_id else sqlite_input
+            st.code(f"File ID: {sqlite_file_id}")
     
     with col2:
-        st.write("**📈 Excel soubor (portfolio.xlsx):**")
-        excel_url = st.text_input(
-            "OneDrive URL pro Excel:",
-            value=st.session_state.excel_url if st.session_state.excel_url != "YOUR_EXCEL_ONEDRIVE_URL_HERE" else "",
-            placeholder="https://1drv.ms/x/s!...",
-            help="Link na portfolio_k_30012024_new.xlsx soubor"
+        st.write("**📈 Excel soubor:**")
+        excel_input = st.text_input(
+            "Google Drive link nebo File ID:",
+            placeholder="https://drive.google.com/file/d/1BxiMVs... nebo přímo ID",
+            help="Celý Google Drive link nebo jen file ID"
         )
         
-        if excel_url != st.session_state.excel_url:
-            st.session_state.excel_url = excel_url
+        excel_file_id = None
+        if excel_input:
+            extracted_id = extract_google_drive_id(excel_input)
+            excel_file_id = extracted_id if extracted_id else excel_input
+            st.code(f"File ID: {excel_file_id}")
     
-    # Test URLs
-    if st.button("🧪 Testovat OneDrive linky"):
+    # Test tlačítko
+    if st.button("🧪 Testovat Google Drive linky"):
         success_count = 0
         
-        if sqlite_url:
-            sqlite_content = download_file_from_onedrive(sqlite_url, "SQLite")
+        if sqlite_file_id:
+            sqlite_content = download_from_google_drive(sqlite_file_id, "SQLite")
             if sqlite_content and sqlite_content.startswith(b'SQLite format 3'):
                 st.success("✅ SQLite databáze OK")
                 success_count += 1
             else:
                 st.error("❌ SQLite databáze problém")
         
-        if excel_url:
-            excel_content = download_file_from_onedrive(excel_url, "Excel")
-            if excel_content and (excel_content.startswith(b'PK\x03\x04') or 'spreadsheet' in str(excel_content[:100])):
+        if excel_file_id:
+            excel_content = download_from_google_drive(excel_file_id, "Excel")
+            if excel_content and (excel_content.startswith(b'PK\x03\x04') or len(excel_content) > 10000):
                 st.success("✅ Excel soubor OK")
                 success_count += 1
             else:
                 st.error("❌ Excel soubor problém")
         
         if success_count == 2:
-            st.success("🎉 Oba soubory jsou přístupné! Klikněte 'Načíst data' pro pokračování.")
-            st.session_state.urls_configured = True
+            st.success("🎉 Oba soubory jsou přístupné!")
+            return sqlite_file_id, excel_file_id
     
-    return sqlite_url, excel_url
+    return sqlite_file_id, excel_file_id
 
-@st.cache_data
-def load_combined_data():
-    """Načte a spojí data z obou OneDrive zdrojů"""
+def load_data_from_google_drive(sqlite_id, excel_id):
+    """Načte data z Google Drive"""
     all_data = pd.DataFrame()
     
-    sqlite_url = st.session_state.sqlite_url
-    excel_url = st.session_state.excel_url
-    
-    # SQLite data z OneDrive
-    if sqlite_url and sqlite_url != "YOUR_SQLITE_ONEDRIVE_URL_HERE":
+    # SQLite z Google Drive
+    if sqlite_id:
         try:
-            sqlite_content = download_file_from_onedrive(sqlite_url, "SQLite")
+            sqlite_content = download_from_google_drive(sqlite_id, "SQLite")
             
-            if sqlite_content:
+            if sqlite_content and sqlite_content.startswith(b'SQLite format 3'):
                 # Uložit do dočasného souboru
-                temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db3")
-                temp_db.write(sqlite_content)
-                temp_db.close()
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".db3")
+                temp_file.write(sqlite_content)
+                temp_file.close()
                 
                 # Načíst data
-                conn = sqlite3.connect(temp_db.name)
+                conn = sqlite3.connect(temp_file.name)
                 query = """
                 SELECT strategy, exitDate, "NetP/L" as netPL, entryDate, ticker, 
                        quantity, entryPrice, exitPrice, commission
@@ -280,688 +186,172 @@ def load_combined_data():
                 """
                 df_sql = pd.read_sql_query(query, conn)
                 conn.close()
+                os.unlink(temp_file.name)
                 
-                # Vyčistit dočasný soubor
-                os.unlink(temp_db.name)
-                
-                if len(df_sql) > 0:
-                    df_sql['source'] = 'SQLite'
-                    all_data = pd.concat([all_data, df_sql], ignore_index=True)
-                print(f"SQLite data: {len(df_sql)} řádků")
+                df_sql['source'] = 'SQLite'
+                all_data = pd.concat([all_data, df_sql], ignore_index=True)
+                st.success(f"✅ SQLite: {len(df_sql)} záznamů")
                 
         except Exception as e:
-            print(f"SQLite error: {e}")
             st.error(f"Chyba při načítání SQLite: {e}")
     
-    # Excel data z OneDrive
-    if excel_url and excel_url != "YOUR_EXCEL_ONEDRIVE_URL_HERE":
+    # Excel z Google Drive
+    if excel_id:
         try:
-            excel_content = download_file_from_onedrive(excel_url, "Excel")
+            excel_content = download_from_google_drive(excel_id, "Excel")
             
             if excel_content:
                 # Načíst Excel z bytes
                 excel_file = io.BytesIO(excel_content)
-                
-                # Načtení všech sheets
                 excel_data = pd.read_excel(excel_file, sheet_name=None)
-                sheet_names = list(excel_data.keys())
-                print(f"Nalezeno {len(sheet_names)} sheets: {sheet_names}")
                 
                 excel_data_combined = pd.DataFrame()
                 
-                for sheet_name in sheet_names:
-                    try:
-                        print(f"\nZpracovávám sheet: {sheet_name}")
-                        df_sheet = excel_data[sheet_name]
-                        print(f"Sheet {sheet_name}: {len(df_sheet)} řádků")
-                        
-                        if len(df_sheet) == 0:
-                            print(f"Sheet {sheet_name} je prázdný, přeskakuji")
-                            continue
-                        
-                        print(f"Sloupce v {sheet_name}: {df_sheet.columns.tolist()}")
-                        
-                        # Map columns pro každý sheet
-                        col_map = {}
-                        for col in df_sheet.columns:
-                            if col == 'Systém':
-                                col_map[col] = 'strategy'
-                            elif col == 'Symbol':
-                                col_map[col] = 'ticker'
-                            elif col == 'Typ':
-                                col_map[col] = 'position'
-                            elif col == 'Datum':
-                                col_map[col] = 'entryDate'
-                            elif col == 'Datum.1':
-                                col_map[col] = 'exitDate'
-                            elif col == 'Počet':
-                                col_map[col] = 'quantity'
-                            elif col == 'Cena':
-                                col_map[col] = 'entryPrice'
-                            elif col == 'Cena.1':
-                                col_map[col] = 'exitPrice'
-                            elif col == '% změna':
-                                col_map[col] = 'chg_percent'
-                            elif col == 'Komise':
-                                col_map[col] = 'commission'
-                            elif col == 'Profit/Loss':
-                                col_map[col] = 'netPL'
-                        
-                        print(f"Mapování pro {sheet_name}: {col_map}")
-                        df_sheet = df_sheet.rename(columns=col_map)
-                        
-                        # Kontrola povinných sloupců
-                        required_cols = ['strategy', 'exitDate', 'netPL']
-                        missing_cols = [col for col in required_cols if col not in df_sheet.columns]
-                        
-                        if len(missing_cols) == 0:
-                            print(f"Sheet {sheet_name}: DATA PŘIJATA - všechny povinné sloupce nalezeny")
-                            df_sheet['source'] = f'Excel-{sheet_name}'
-                            df_sheet['sheet_name'] = sheet_name
-                            excel_data_combined = pd.concat([excel_data_combined, df_sheet], ignore_index=True)
-                            print(f"Sheet {sheet_name}: přidáno {len(df_sheet)} řádků")
-                        else:
-                            print(f"Sheet {sheet_name}: DATA ZAMÍTNUTA - chybí sloupce: {missing_cols}")
+                for sheet_name, df_sheet in excel_data.items():
+                    if len(df_sheet) == 0:
+                        continue
                     
-                    except Exception as sheet_error:
-                        print(f"Chyba při zpracování sheet {sheet_name}: {sheet_error}")
+                    # Mapování sloupců
+                    col_map = {
+                        'Systém': 'strategy',
+                        'Symbol': 'ticker',
+                        'Typ': 'position',
+                        'Datum': 'entryDate',
+                        'Datum.1': 'exitDate',
+                        'Počet': 'quantity',
+                        'Cena': 'entryPrice',
+                        'Cena.1': 'exitPrice',
+                        '% změna': 'chg_percent',
+                        'Komise': 'commission',
+                        'Profit/Loss': 'netPL'
+                    }
+                    
+                    df_sheet = df_sheet.rename(columns=col_map)
+                    
+                    # Kontrola povinných sloupců
+                    required_cols = ['strategy', 'exitDate', 'netPL']
+                    missing_cols = [col for col in required_cols if col not in df_sheet.columns]
+                    
+                    if len(missing_cols) == 0:
+                        df_sheet['source'] = f'Excel-{sheet_name}'
+                        excel_data_combined = pd.concat([excel_data_combined, df_sheet], ignore_index=True)
                 
-                # Přidání všech Excel dat
-                if len(excel_data_combined) > 0:
-                    all_data = pd.concat([all_data, excel_data_combined], ignore_index=True)
-                    print(f"\nCELKEM z Excelu přidáno: {len(excel_data_combined)} řádků ze {len(sheet_names)} sheets")
-                else:
-                    print("\nŽádná data z Excel sheets nebyla přijata")
+                all_data = pd.concat([all_data, excel_data_combined], ignore_index=True)
+                st.success(f"✅ Excel: {len(excel_data_combined)} záznamů")
                 
         except Exception as e:
-            print(f"Excel error: {e}")
             st.error(f"Chyba při načítání Excel: {e}")
     
-    if all_data.empty:
-        return pd.DataFrame()
-    
-    # Process data - konverze datumů a čištění
-    print(f"\nZpracovávám kombinovaná data: {len(all_data)} řádků")
-    all_data['exitDate'] = convert_to_date_only(all_data['exitDate'])
-    if 'entryDate' in all_data.columns:
-        all_data['entryDate'] = convert_to_date_only(all_data['entryDate'])
-
-    all_data['netPL'] = pd.to_numeric(all_data['netPL'], errors='coerce')
-    
-    # Odstranění řádků s neplatnými daty
-    original_count = len(all_data)
-    all_data = all_data.dropna(subset=['exitDate', 'netPL', 'strategy'])
-    
-    # Dodatečné filtrování datumů (jen pro jistotu)
-    all_data = all_data[
-        (all_data['exitDate'] >= pd.Timestamp('2020-01-01')) & 
-        (all_data['exitDate'] <= pd.Timestamp('2030-12-31'))
-    ]
-    
-    final_count = len(all_data)
-    print(f"Po čištění a filtrování: {final_count} řádků (odstraněno {original_count - final_count})")
-    
-    all_data = all_data.sort_values('exitDate')
-    
-    if final_count > 0:
-        print(f"Finální rozsah datumů: {all_data['exitDate'].min()} až {all_data['exitDate'].max()}")
+    # Zpracování dat
+    if not all_data.empty:
+        all_data['exitDate'] = pd.to_datetime(all_data['exitDate'], errors='coerce')
+        all_data['netPL'] = pd.to_numeric(all_data['netPL'], errors='coerce')
+        all_data = all_data.dropna(subset=['exitDate', 'netPL', 'strategy'])
+        all_data = all_data.sort_values('exitDate')
     
     return all_data
 
-def filter_by_time(df, time_filter, start_date=None, end_date=None):
-    """Filtruje data podle času"""
-    if time_filter == "All Time" or df.empty:
-        return df
-    
-    now = datetime.now()
-    
-    if time_filter == "Vlastní období (OD-DO)":
-        if start_date and end_date:
-            start_ts = pd.Timestamp(start_date)
-            end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            return df[(df['exitDate'] >= start_ts) & (df['exitDate'] <= end_ts)]
-        return df
-    elif time_filter == "YTD":
-        start_ts = pd.Timestamp(now.year, 1, 1)
-    elif time_filter == "Kalendářní rok":
-        start_ts = pd.Timestamp(now.year, 1, 1)
-    elif time_filter == "Poslední kalendářní rok":
-        start_ts = pd.Timestamp(now.year - 1, 1, 1)
-        end_ts = pd.Timestamp(now.year - 1, 12, 31)
-        return df[(df['exitDate'] >= start_ts) & (df['exitDate'] <= end_ts)]
-    elif time_filter == "Posledních 12 měsíců":
-        start_ts = pd.Timestamp(now - timedelta(days=365))
-    elif time_filter == "Posledních 6 měsíců":
-        start_ts = pd.Timestamp(now - timedelta(days=180))
-    elif time_filter == "Poslední 3 měsíce":
-        start_ts = pd.Timestamp(now - timedelta(days=90))
-    elif time_filter == "Posledních 30 dní":
-        start_ts = pd.Timestamp(now - timedelta(days=30))
-    elif time_filter == "MTD":
-        start_ts = pd.Timestamp(now.year, now.month, 1)
-    elif time_filter == "Týden":
-        start_ts = pd.Timestamp(now - timedelta(days=7))
-    else:
-        return df
-    
-    return df[df['exitDate'] >= start_ts]
-
 def calc_metrics(df):
-    """Výpočet portfolio metrik"""
+    """Výpočet základních metrik"""
     if df.empty:
         return {}
     
     total_pl = df['netPL'].sum()
-    total_pl_pct = (total_pl / INITIAL_CAPITAL) * 100
     total_trades = len(df)
     wins = len(df[df['netPL'] > 0])
-    losses = len(df[df['netPL'] < 0])
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-    
-    avg_win = df[df['netPL'] > 0]['netPL'].mean() if wins > 0 else 0
-    avg_loss = df[df['netPL'] < 0]['netPL'].mean() if losses > 0 else 0
-    profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else 0
-    
-    # Drawdown
-    df_sorted = df.sort_values('exitDate')
-    df_sorted['cum_pl'] = df_sorted['netPL'].cumsum()
-    df_sorted['running_max'] = df_sorted['cum_pl'].expanding().max()
-    df_sorted['dd'] = df_sorted['cum_pl'] - df_sorted['running_max']
-    max_dd = df_sorted['dd'].min()
     
     return {
         'total_pl': total_pl,
-        'total_pl_percent': total_pl_pct,
+        'total_pl_percent': (total_pl / INITIAL_CAPITAL) * 100,
         'total_capital': INITIAL_CAPITAL + total_pl,
         'total_trades': total_trades,
         'winning_trades': wins,
-        'losing_trades': losses,
-        'win_rate': win_rate,
-        'avg_win': avg_win,
-        'avg_loss': avg_loss,
-        'profit_factor': profit_factor,
-        'max_drawdown': max_dd
+        'win_rate': win_rate
     }
 
-def create_cumulative_chart(df, title="Kumulativní P&L"):
-    """Graf kumulativního P&L"""
+def create_simple_chart(df):
+    """Jednoduchý kumulativní graf"""
     if df.empty:
         return go.Figure()
     
     df_sorted = df.sort_values('exitDate')
     df_sorted['cum_pl'] = df_sorted['netPL'].cumsum()
-    df_sorted['cum_pct'] = (df_sorted['cum_pl'] / INITIAL_CAPITAL) * 100
     
     fig = go.Figure()
-    
     fig.add_trace(go.Scatter(
         x=df_sorted['exitDate'],
         y=df_sorted['cum_pl'],
         mode='lines',
-        name='P&L (USD)',
-        line=dict(color='blue', width=2),
-        yaxis='y'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=df_sorted['exitDate'],
-        y=df_sorted['cum_pct'],
-        mode='lines',
-        name='P&L (%)',
-        line=dict(color='orange', width=2),
-        yaxis='y2'
+        name='Kumulativní P&L',
+        line=dict(color='blue', width=2)
     ))
     
     fig.update_layout(
-        title=title,
+        title="Kumulativní P&L",
         xaxis_title="Datum",
-        yaxis=dict(title="P&L (USD)", side="left", color="blue"),
-        yaxis2=dict(title="P&L (%)", side="right", overlaying="y", color="orange"),
-        hovermode='x unified',
-        height=600
+        yaxis_title="P&L (USD)",
+        height=500
     )
     
     return fig
-
-def create_monthly_heatmap(df, title="Heat mapa měsíční výkonnosti"):
-    """Vytvoří heat mapu výkonnosti podle měsíců a let"""
-    if df.empty:
-        return go.Figure()
-    
-    # Příprava dat - agregace podle roku a měsíce
-    df_copy = df.copy()
-    df_copy['year'] = df_copy['exitDate'].dt.year
-    df_copy['month'] = df_copy['exitDate'].dt.month
-    
-    # Agregace P&L podle roku a měsíce
-    monthly_data = df_copy.groupby(['year', 'month'])['netPL'].sum().reset_index()
-    
-    # Vytvoření pivot tabulky pro heat mapu
-    pivot_data = monthly_data.pivot(index='year', columns='month', values='netPL')
-    
-    # Doplnění chybějících měsíců nulami
-    for month in range(1, 13):
-        if month not in pivot_data.columns:
-            pivot_data[month] = 0
-    
-    # Seřazení sloupců (měsíců)
-    pivot_data = pivot_data.reindex(columns=sorted(pivot_data.columns))
-    
-    # Doplnění NaN hodnot nulami
-    pivot_data = pivot_data.fillna(0)
-    
-    # Názvy měsíců pro osu X
-    month_names = ['Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čer', 
-                   'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro']
-    
-    # Vytvoření heat mapy
-    fig = go.Figure(data=go.Heatmap(
-        z=pivot_data.values,
-        x=month_names,
-        y=pivot_data.index,
-        colorscale=[
-            [0, 'darkred'],
-            [0.25, 'red'], 
-            [0.4, 'lightcoral'],
-            [0.5, 'white'],
-            [0.6, 'lightgreen'],
-            [0.75, 'green'],
-            [1, 'darkgreen']
-        ],
-        zmid=0,
-        colorbar=dict(title="P&L (USD)"),
-        hovertemplate='<b>%{y}</b><br>' +
-                      'Měsíc: %{x}<br>' +
-                      'P&L: $%{z:,.0f}<br>' +
-                      '<extra></extra>',
-        text=[[f"${val:,.0f}" if val != 0 else "" for val in row] for row in pivot_data.values],
-        texttemplate="%{text}",
-        textfont={"size": 10},
-        showscale=True
-    ))
-    
-    fig.update_layout(
-        title=title,
-        xaxis_title="Měsíc",
-        yaxis_title="Rok",
-        height=400,
-        template='plotly_white',
-        font=dict(size=12)
-    )
-    
-    return fig
-
-def create_strategy_chart(df):
-    """Vytvoří graf porovnání strategií"""
-    if df.empty:
-        return go.Figure()
-    
-    totals = df.groupby('strategy')['netPL'].sum().sort_values(ascending=True)
-    
-    fig = go.Figure(go.Bar(
-        y=totals.index,
-        x=totals.values,
-        orientation='h',
-        marker_color=['red' if x < 0 else 'green' for x in totals.values]
-    ))
-    
-    fig.update_layout(
-        title="P&L podle strategií",
-        xaxis_title="P&L (USD)",
-        yaxis_title="Strategie"
-    )
-    
-    return fig
-
-def create_individual_chart(df, title="Jednotlivé obchody"):
-    """Graf jednotlivých obchodů"""
-    if df.empty:
-        return go.Figure()
-    
-    df_sorted = df.sort_values('exitDate')
-    df_sorted['trade_pct'] = (df_sorted['netPL'] / INITIAL_CAPITAL) * 100
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=df_sorted['exitDate'],
-        y=df_sorted['netPL'],
-        mode='lines+markers',
-        name='P&L (USD)',
-        line=dict(color='blue'),
-        yaxis='y'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=df_sorted['exitDate'],
-        y=df_sorted['trade_pct'],
-        mode='lines+markers',
-        name='P&L (%)',
-        line=dict(color='orange'),
-        yaxis='y2'
-    ))
-    
-    fig.update_layout(
-        title=title,
-        xaxis_title="Datum",
-        yaxis=dict(title="P&L (USD)", side="left", color="blue"),
-        yaxis2=dict(title="P&L (%)", side="right", overlaying="y", color="orange"),
-        hovermode='x unified',
-        height=600
-    )
-    
-    return fig
-
-def create_strategy_monthly_heatmap(df, title="Heat mapa strategií podle měsíců"):
-    """Vytvoří heat mapu výkonnosti strategií podle měsíců"""
-    if df.empty:
-        return go.Figure()
-    
-    # Příprava dat - agregace podle strategie a měsíce
-    df_copy = df.copy()
-    df_copy['month'] = df_copy['exitDate'].dt.month
-    
-    # Agregace P&L podle strategie a měsíce
-    strategy_monthly = df_copy.groupby(['strategy', 'month'])['netPL'].sum().reset_index()
-    
-    # Vytvoření pivot tabulky pro heat mapu
-    pivot_data = strategy_monthly.pivot(index='strategy', columns='month', values='netPL')
-    
-    # Doplnění chybějících měsíců nulami
-    for month in range(1, 13):
-        if month not in pivot_data.columns:
-            pivot_data[month] = 0
-    
-    # Seřazení sloupců (měsíců)
-    pivot_data = pivot_data.reindex(columns=sorted(pivot_data.columns))
-    
-    # Doplnění NaN hodnot nulami
-    pivot_data = pivot_data.fillna(0)
-    
-    # Názvy měsíců pro osu X
-    month_names = ['Led', 'Úno', 'Bře', 'Dub', 'Kvě', 'Čer', 
-                   'Čvc', 'Srp', 'Zář', 'Říj', 'Lis', 'Pro']
-    
-    # Vytvoření heat mapy
-    fig = go.Figure(data=go.Heatmap(
-        z=pivot_data.values,
-        x=month_names,
-        y=pivot_data.index,
-        colorscale=[
-            [0, 'darkred'],
-            [0.25, 'red'], 
-            [0.4, 'lightcoral'],
-            [0.5, 'white'],
-            [0.6, 'lightgreen'],
-            [0.75, 'green'],
-            [1, 'darkgreen']
-        ],
-        zmid=0,
-        colorbar=dict(title="P&L (USD)"),
-        hovertemplate='<b>%{y}</b><br>' +
-                      'Měsíc: %{x}<br>' +
-                      'P&L: $%{z:,.0f}<br>' +
-                      '<extra></extra>',
-        text=[[f"${val:,.0f}" if val != 0 else "" for val in row] for row in pivot_data.values],
-        texttemplate="%{text}",
-        textfont={"size": 9},
-        showscale=True
-    ))
-    
-    fig.update_layout(
-        title=title,
-        xaxis_title="Měsíc",
-        yaxis_title="Strategie",
-        height=max(400, len(pivot_data.index) * 40),  # Dynamická výška podle počtu strategií
-        template='plotly_white',
-        font=dict(size=12)
-    )
-    
-    return fig
-
-def show_help():
-    """Nápověda k metrikám"""
-    with st.expander("ℹ️ Vysvětlení metrik"):
-        st.markdown("""
-        **💰 Total P&L:** Součet všech P&L z obchodů
-        
-        **📈 Kumulativní výkonnost:** (Total P&L / 50,000) × 100
-        
-        **📊 Celkový kapitál:** 50,000 + Total P&L
-        
-        **🎯 Win Rate:** (Vítězné obchody / Celkem obchodů) × 100
-        
-        **⚖️ Profit Factor:** |Průměrný zisk / Průměrná ztráta|
-        
-        **📉 Max Drawdown:** Největší pokles od vrcholu
-        
-        **🔥 Heat mapa:** Vizualizace měsíční výkonnosti podle let a měsíců
-        - 🟢 Zelená = Pozitivní výkonnost v daném měsíci
-        - 🔴 Červená = Negativní výkonnost v daném měsíci
-        - ⚪ Bílá = Žádné obchody nebo nulový P&L
-        """)
-        
-    with st.expander("📊 Jak číst heat mapy"):
-        st.markdown("""
-        **🔥 Heat mapa měsíční výkonnosti** - celkový přehled:
-        
-        📅 **Osa X:** Měsíce v roce (Led, Úno, Bře...)
-        📅 **Osa Y:** Roky (2023, 2024...)
-        🎨 **Barvy:** 🟢 Zisk / ⚪ Neutrál / 🔴 Ztráta
-        
-        **🎯 Heat mapa strategií podle měsíců** - detailní analýza:
-        
-        📅 **Osa X:** Měsíce v roce
-        📅 **Osa Y:** Jednotlivé strategie
-        🎨 **Barvy:** Stejné jako výše
-        
-        💡 **Tipy pro analýzu:**
-        - 🔍 **Sezónní vzory:** Které měsíce jsou pro jaké strategie nejlepší?
-        - ⚖️ **Rozložení rizika:** Jsou všechny strategie ziskové ve stejných měsících?
-        - 📈 **Optimalizace:** Kdy aktivovat/deaktivovat konkrétní strategie?
-        - 🎯 **Diverzifikace:** Kombinace strategií pro stabilnější výkonnost
-        """)
 
 # HLAVNÍ APLIKACE
 def main():
     st.title("📊 Trading Portfolio Dashboard")
-    st.subheader("SQLite + Excel - Kombinované zdroje (OneDrive)")
+    st.subheader("Google Drive Solution")
     
-    # Konfigurace OneDrive URLs
-    sqlite_url, excel_url = setup_onedrive_urls()
+    st.info("💡 **Google Drive** je spolehlivější než OneDrive pro binární soubory (.db3)")
     
-    # Načtení dat pouze pokud jsou URL nakonfigurovány
-    if not sqlite_url or not excel_url or sqlite_url == "YOUR_SQLITE_ONEDRIVE_URL_HERE" or excel_url == "YOUR_EXCEL_ONEDRIVE_URL_HERE":
-        st.info("🔧 **Nakonfigurujte OneDrive linky výše pro pokračování**")
+    # Konfigurace Google Drive
+    sqlite_id, excel_id = setup_google_drive()
+    
+    if not sqlite_id or not excel_id:
+        st.warning("⚠️ Nakonfigurujte Google Drive file IDs pro pokračování")
         return
-    
-    # Tlačítko pro načtení dat
-    if st.button("🚀 Načíst data z OneDrive", type="primary"):
-        st.cache_data.clear()  # Vyčistit cache pro nové načtení
-        st.rerun()
     
     # Načtení dat
-    with st.spinner("Načítám data z OneDrive..."):
-        df = load_combined_data()
-    
-    if df.empty:
-        st.error("Nepodařilo se načíst data z OneDrive")
-        st.info("Zkontrolujte OneDrive linky a oprávnění souborů")
-        return
-    
-    # Success
-    msg = f"✅ Načteno {len(df)} obchodů"
-    if 'source' in df.columns:
-        counts = df['source'].value_counts()
-        info = " | ".join([f"{k}: {v}" for k, v in counts.items()])
-        msg += f" | {info}"
-    st.success(msg)
-    
-    # Debug
-    with st.expander("🔧 Debug"):
+    if st.button("🚀 Načíst data z Google Drive", type="primary"):
+        with st.spinner("Načítám data z Google Drive..."):
+            df = load_data_from_google_drive(sqlite_id, excel_id)
+        
+        if df.empty:
+            st.error("❌ Nepodařilo se načíst žádná data")
+            return
+        
+        # Success
+        msg = f"✅ Načteno {len(df)} obchodů"
         if 'source' in df.columns:
-            st.write("**Zdroje:**")
-            for source, count in df['source'].value_counts().items():
-                st.write(f"- {source}: {count}")
+            counts = df['source'].value_counts()
+            info = " | ".join([f"{k}: {v}" for k, v in counts.items()])
+            msg += f" | {info}"
+        st.success(msg)
         
-        st.write(f"**Rozsah:** {df['exitDate'].min()} až {df['exitDate'].max()}")
-        st.write("**Čas odstraněn z datumů**")
+        # Základní metriky
+        metrics = calc_metrics(df)
         
-        cols = ['strategy', 'exitDate', 'netPL']
-        if 'source' in df.columns:
-            cols.append('source')
-        st.dataframe(df[cols].head())
-    
-    # Filtry
-    st.sidebar.header("🔧 Filtry")
-    
-    time_filter = st.sidebar.selectbox(
-        "📅 Období:",
-        ["All Time", "Vlastní období (OD-DO)", "YTD", "Kalendářní rok", 
-         "Poslední kalendářní rok", "Posledních 12 měsíců", "Posledních 6 měsíců", 
-         "Poslední 3 měsíce", "Posledních 30 dní", "MTD", "Týden"]
-    )
-    
-    start_date = None
-    end_date = None
-    if time_filter == "Vlastní období (OD-DO)":
-        min_dt = df['exitDate'].min().date()
-        max_dt = df['exitDate'].max().date()
-        
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            start_date = st.date_input("OD:", value=min_dt, min_value=min_dt, max_value=max_dt)
-        with col2:
-            end_date = st.date_input("DO:", value=max_dt, min_value=min_dt, max_value=max_dt)
-    
-    strategies = st.sidebar.multiselect(
-        "📈 Strategie:",
-        options=df['strategy'].unique(),
-        default=df['strategy'].unique()
-    )
-    
-    # Filtrování
-    filtered_df = filter_by_time(df, time_filter, start_date, end_date)
-    filtered_df = filtered_df[filtered_df['strategy'].isin(strategies)]
-    
-    # Metriky
-    metrics = calc_metrics(filtered_df)
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.metric("💰 Total P&L", f"${metrics.get('total_pl', 0):,.2f}")
-    
-    with col2:
-        st.metric(
-            "📈 Výkonnost",
-            f"{metrics.get('total_pl_percent', 0):.2f}%",
-            delta=f"${metrics.get('total_pl', 0):,.0f}"
-        )
-    
-    with col3:
-        st.metric("📊 Kapitál", f"${metrics.get('total_capital', INITIAL_CAPITAL):,.2f}")
-    
-    with col4:
-        st.metric(
-            "🎯 Win Rate",
-            f"{metrics.get('win_rate', 0):.1f}%",
-            delta=f"{metrics.get('winning_trades', 0)}/{metrics.get('total_trades', 0)}"
-        )
-    
-    with col5:
-        st.metric("📉 Max DD", f"${metrics.get('max_drawdown', 0):,.2f}")
-    
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Overview", "📈 Strategie", "📉 Grafy"])
-    
-    with tab1:
-        st.subheader("Portfolio Performance")
-        show_help()
-        
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.write("**Trading Stats:**")
-            st.write(f"Celkem obchodů: {metrics.get('total_trades', 0)}")
-            st.write(f"Vítězné: {metrics.get('winning_trades', 0)}")
-            st.write(f"Ztrátové: {metrics.get('losing_trades', 0)}")
-            st.write(f"Win Rate: {metrics.get('win_rate', 0):.2f}%")
-            st.write(f"Výkonnost: {metrics.get('total_pl_percent', 0):.2f}%")
+            st.metric("💰 Total P&L", f"${metrics.get('total_pl', 0):,.2f}")
         
         with col2:
-            st.write("**Risk Metrics:**")
-            st.write(f"Průměrný zisk: ${metrics.get('avg_win', 0):.2f}")
-            st.write(f"Průměrná ztráta: ${metrics.get('avg_loss', 0):.2f}")
-            st.write(f"Profit Factor: {metrics.get('profit_factor', 0):.2f}")
-            st.write(f"Max Drawdown: ${metrics.get('max_drawdown', 0):.2f}")
-            st.write(f"Počáteční kapitál: ${INITIAL_CAPITAL:,}")
+            st.metric("📊 Celkový kapitál", f"${metrics.get('total_capital', INITIAL_CAPITAL):,.2f}")
         
-        st.plotly_chart(create_cumulative_chart(filtered_df), use_container_width=True)
-        st.plotly_chart(create_individual_chart(filtered_df), use_container_width=True)
-        st.plotly_chart(create_monthly_heatmap(filtered_df), use_container_width=True)
-    
-    with tab2:
-        st.subheader("Strategie")
+        with col3:
+            st.metric("🎯 Win Rate", f"{metrics.get('win_rate', 0):.1f}%")
         
-        strategy_data = []
-        for strategy in filtered_df['strategy'].unique():
-            strat_df = filtered_df[filtered_df['strategy'] == strategy]
-            strat_metrics = calc_metrics(strat_df)
-            strategy_data.append({
-                'Strategie': strategy,
-                'P&L (USD)': f"${strat_metrics['total_pl']:,.2f}",
-                'P&L (%)': f"{strat_metrics['total_pl_percent']:.2f}%",
-                'Obchody': strat_metrics['total_trades'],
-                'Win Rate': f"{strat_metrics['win_rate']:.1f}%",
-                'Profit Factor': f"{strat_metrics['profit_factor']:.2f}"
-            })
+        # Graf
+        st.plotly_chart(create_simple_chart(df), use_container_width=True)
         
-        st.dataframe(pd.DataFrame(strategy_data), use_container_width=True)
-        st.plotly_chart(create_strategy_chart(filtered_df), use_container_width=True, key="strategy_comparison")
-        st.plotly_chart(create_strategy_monthly_heatmap(filtered_df), use_container_width=True, key="strategy_heatmap")
-    
-    with tab3:
-        st.subheader("Grafy jednotlivých strategií")
-        
-        for i, strategy in enumerate(strategies):
-            st.write(f"**{strategy}**")
-            strat_data = filtered_df[filtered_df['strategy'] == strategy]
+        # Debug
+        with st.expander("🔧 Debug"):
+            if 'source' in df.columns:
+                st.write("**Zdroje:**")
+                for source, count in df['source'].value_counts().items():
+                    st.write(f"- {source}: {count}")
             
-            # První řádek - kumulativní a jednotlivé obchody
-            col1, col2 = st.columns(2)
-            with col1:
-                st.plotly_chart(
-                    create_cumulative_chart(strat_data, f"Kumulativní - {strategy}"),
-                    use_container_width=True,
-                    key=f"strategy_cumulative_{i}_{strategy.replace(' ', '_')}"
-                )
-            with col2:
-                st.plotly_chart(
-                    create_individual_chart(strat_data, f"Obchody - {strategy}"),
-                    use_container_width=True,
-                    key=f"strategy_individual_{i}_{strategy.replace(' ', '_')}"
-                )
-            
-            # Druhý řádek - heat mapa pro strategii
-            st.plotly_chart(
-                create_monthly_heatmap(strat_data, f"Heat mapa - {strategy}"),
-                use_container_width=True,
-                key=f"strategy_heatmap_{i}_{strategy.replace(' ', '_')}"
-            )
-            
-            st.markdown("---")
-    
-    # Footer
-    st.sidebar.markdown("---")
-    st.sidebar.info(f"📊 {len(df)} obchodů")
-    st.sidebar.info(f"💰 Kapitál: ${INITIAL_CAPITAL:,}")
-    st.sidebar.info("☁️ OneDrive + Cloud")
-    
-    # Refresh tlačítko
-    if st.sidebar.button("🔄 Aktualizovat data"):
-        st.cache_data.clear()
-        st.rerun()
+            st.dataframe(df[['strategy', 'exitDate', 'netPL', 'source']].head())
 
 if __name__ == "__main__":
     main()
