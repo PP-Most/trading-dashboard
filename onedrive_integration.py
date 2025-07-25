@@ -1,7 +1,7 @@
 """
 Trading Portfolio Dashboard with OneDrive Integration (FIXED)
 ============================================================
-Správná implementace pro OneDrive direct download
+Správná implementace pro OneDrive direct download - OPRAVENÁ SYNTAX
 """
 
 import streamlit as st
@@ -14,7 +14,6 @@ import re
 import os
 import requests
 import tempfile
-import base64
 
 # Konfigurace stránky
 st.set_page_config(
@@ -25,8 +24,11 @@ st.set_page_config(
 )
 
 # Konfigurace OneDrive
-ONEDRIVE_SHARE_URL = "YOUR_ONEDRIVE_SHARE_URL_HERE"  # Celý share URL z OneDrive
 INITIAL_CAPITAL = 50000
+
+# Session state pro OneDrive URL
+if 'onedrive_url' not in st.session_state:
+    st.session_state.onedrive_url = "YOUR_ONEDRIVE_SHARE_URL_HERE"
 
 def convert_onedrive_url_to_direct(share_url):
     """Konvertuje OneDrive share URL na direct download URL"""
@@ -144,9 +146,13 @@ def manual_onedrive_config():
     # Input pro URL
     user_url = st.text_input(
         "📎 Vložte váš OneDrive share URL:",
+        value=st.session_state.onedrive_url if st.session_state.onedrive_url != "YOUR_ONEDRIVE_SHARE_URL_HERE" else "",
         placeholder="https://1drv.ms/u/s!... nebo https://onedrive.live.com/...",
         help="Vložte celý URL, který jste zkopírovali z OneDrive"
     )
+    
+    if user_url and user_url != st.session_state.onedrive_url:
+        st.session_state.onedrive_url = user_url
     
     if user_url:
         if st.button("🧪 Testovat OneDrive link"):
@@ -155,7 +161,7 @@ def manual_onedrive_config():
                 
                 if result:
                     st.success("🎉 **Úspěch!** OneDrive link funguje!")
-                    st.info(f"💾 **Pro použití v aplikaci, zkopírujte tento URL:**")
+                    st.info(f"💾 **Tento URL je nyní uložen pro aplikaci**")
                     st.code(user_url)
                     
                     # Pokus o načtení dat
@@ -166,6 +172,12 @@ def manual_onedrive_config():
                         os.unlink(result)
                         
                         st.success(f"✅ **Databáze obsahuje {df.iloc[0]['count']} záznamů**")
+                        
+                        # Uložit úspěšný URL do session state
+                        st.session_state.onedrive_url = user_url
+                        st.session_state.onedrive_working = True
+                        
+                        return user_url
                         
                     except Exception as e:
                         st.error(f"❌ Chyba při čtení databáze: {e}")
@@ -185,21 +197,22 @@ def manual_onedrive_config():
 
 def load_data_from_onedrive():
     """Načte data z OneDrive pomocí konfigurovaného URL"""
-    if not ONEDRIVE_SHARE_URL or ONEDRIVE_SHARE_URL == "YOUR_ONEDRIVE_SHARE_URL_HERE":
+    onedrive_url = st.session_state.onedrive_url
+    
+    if not onedrive_url or onedrive_url == "YOUR_ONEDRIVE_SHARE_URL_HERE":
         st.error("🔗 OneDrive URL není nakonfigurován!")
         
         # Zobrazit konfigurační panel
         configured_url = manual_onedrive_config()
         
-        if configured_url:
-            # Dočasně použít URL od uživatele
-            global ONEDRIVE_SHARE_URL
-            ONEDRIVE_SHARE_URL = configured_url
+        if configured_url and configured_url != "YOUR_ONEDRIVE_SHARE_URL_HERE":
+            # URL je nyní uložen v session state
+            onedrive_url = configured_url
         else:
             return pd.DataFrame()
     
     try:
-        temp_db_path = try_multiple_download_methods(ONEDRIVE_SHARE_URL, "tradebook.db3")
+        temp_db_path = try_multiple_download_methods(onedrive_url, "tradebook.db3")
         
         if not temp_db_path:
             st.error("❌ Nepodařilo se stáhnout databázi z OneDrive")
@@ -287,8 +300,34 @@ def load_data_from_uploaded_file(uploaded_file):
         st.error(f"Chyba při zpracování nahraného souboru: {e}")
         return pd.DataFrame()
 
-# Zkrácené verze funkcí pro zobrazení (stejné jako dříve)
+def filter_data_by_time(df, time_filter):
+    """Filtruje data podle časového období"""
+    if time_filter == "All Time" or df.empty:
+        return df
+    
+    if not pd.api.types.is_datetime64_any_dtype(df['exitDate']):
+        return df
+    
+    now = datetime.now()
+    
+    if time_filter == "YTD":
+        start_date = pd.Timestamp(now.year, 1, 1)
+    elif time_filter == "Posledních 12 měsíců":
+        start_date = pd.Timestamp(now - timedelta(days=365))
+    elif time_filter == "MTD":
+        start_date = pd.Timestamp(now.year, now.month, 1)
+    elif time_filter == "Týden":
+        start_date = pd.Timestamp(now - timedelta(days=7))
+    else:
+        return df
+    
+    try:
+        return df[df['exitDate'] >= start_date]
+    except Exception:
+        return df
+
 def calculate_portfolio_metrics(df):
+    """Vypočítá portfolio metriky"""
     if df.empty:
         return {}
     
@@ -296,7 +335,20 @@ def calculate_portfolio_metrics(df):
     total_pl_percent = (total_pl / INITIAL_CAPITAL) * 100
     total_trades = len(df)
     winning_trades = len(df[df['netPL'] > 0])
+    losing_trades = len(df[df['netPL'] < 0])
     win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+    
+    avg_win = df[df['netPL'] > 0]['netPL'].mean() if winning_trades > 0 else 0
+    avg_loss = df[df['netPL'] < 0]['netPL'].mean() if losing_trades > 0 else 0
+    
+    profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    
+    # Kalkulace drawdown
+    df_sorted = df.sort_values('exitDate')
+    df_sorted['cumulative_pl'] = df_sorted['netPL'].cumsum()
+    df_sorted['running_max'] = df_sorted['cumulative_pl'].expanding().max()
+    df_sorted['drawdown'] = df_sorted['cumulative_pl'] - df_sorted['running_max']
+    max_drawdown = df_sorted['drawdown'].min()
     
     return {
         'total_pl': total_pl,
@@ -304,28 +356,71 @@ def calculate_portfolio_metrics(df):
         'total_capital': INITIAL_CAPITAL + total_pl,
         'total_trades': total_trades,
         'winning_trades': winning_trades,
-        'win_rate': win_rate
+        'losing_trades': losing_trades,
+        'win_rate': win_rate,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'profit_factor': profit_factor,
+        'max_drawdown': max_drawdown
     }
 
-def create_simple_chart(df):
+def calculate_strategy_metrics(df):
+    """Vypočítá metriky pro jednotlivé strategie"""
+    strategy_metrics = {}
+    
+    for strategy in df['strategy'].unique():
+        strategy_data = df[df['strategy'] == strategy]
+        strategy_metrics[strategy] = calculate_portfolio_metrics(strategy_data)
+    
+    return strategy_metrics
+
+def create_cumulative_pl_chart(df, title="Kumulativní P&L"):
+    """Vytvoří graf kumulativního P&L"""
     if df.empty:
         return go.Figure()
     
     df_sorted = df.sort_values('exitDate')
     df_sorted['cumulative_pl'] = df_sorted['netPL'].cumsum()
+    df_sorted['cumulative_percent'] = (df_sorted['cumulative_pl'] / INITIAL_CAPITAL) * 100
     
     fig = go.Figure()
+    
     fig.add_trace(go.Scatter(
         x=df_sorted['exitDate'],
         y=df_sorted['cumulative_pl'],
         mode='lines',
-        name='Kumulativní P&L'
+        name='P&L (USD)',
+        line=dict(color='#1f77b4', width=2)
     ))
     
     fig.update_layout(
-        title="Kumulativní P&L",
+        title=title,
         xaxis_title="Datum",
-        yaxis_title="P&L (USD)",
+        yaxis_title="Kumulativní P&L (USD)",
+        template='plotly_white',
+        height=500
+    )
+    
+    return fig
+
+def create_strategy_comparison_chart(df):
+    """Vytvoří graf porovnání strategií"""
+    if df.empty:
+        return go.Figure()
+    
+    strategy_totals = df.groupby('strategy')['netPL'].sum().sort_values(ascending=True)
+    
+    fig = go.Figure(go.Bar(
+        y=strategy_totals.index,
+        x=strategy_totals.values,
+        orientation='h',
+        marker_color=['red' if x < 0 else 'green' for x in strategy_totals.values]
+    ))
+    
+    fig.update_layout(
+        title="Celkový P&L podle strategií",
+        xaxis_title="P&L (USD)",
+        yaxis_title="Strategie",
         template='plotly_white'
     )
     
@@ -364,7 +459,8 @@ def main():
         )
         
         if uploaded_file is not None:
-            df = load_data_from_uploaded_file(uploaded_file)
+            with st.spinner("Zpracovávám nahraný soubor..."):
+                df = load_data_from_uploaded_file(uploaded_file)
     
     # Zobrazení dat
     if df.empty:
@@ -376,30 +472,110 @@ def main():
     
     st.success(f"✅ Načteno {len(df)} obchodů ze strategií: {', '.join(df['strategy'].unique())}")
     
-    # Základní metriky
-    metrics = calculate_portfolio_metrics(df)
+    # Sidebar filtry
+    st.sidebar.header("🔧 Nastavení")
     
-    col1, col2, col3 = st.columns(3)
+    time_filter = st.sidebar.selectbox(
+        "📅 Časové období:",
+        ["All Time", "YTD", "Posledních 12 měsíců", "MTD", "Týden"]
+    )
+    
+    selected_strategies = st.sidebar.multiselect(
+        "📈 Vyberte strategie:",
+        options=df['strategy'].unique(),
+        default=df['strategy'].unique()
+    )
+    
+    # Filtrování dat
+    filtered_df = filter_data_by_time(df, time_filter)
+    filtered_df = filtered_df[filtered_df['strategy'].isin(selected_strategies)]
+    
+    # Základní metriky
+    metrics = calculate_portfolio_metrics(filtered_df)
+    
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("💰 Total P&L", f"${metrics.get('total_pl', 0):,.2f}")
+        st.metric(
+            "💰 Total P&L", 
+            f"${metrics.get('total_pl', 0):,.2f}",
+            delta=f"{metrics.get('total_pl_percent', 0):.2f}%"
+        )
     
     with col2:
-        st.metric("📊 Celkový kapitál", f"${metrics.get('total_capital', INITIAL_CAPITAL):,.2f}")
+        st.metric(
+            "📊 Celkový kapitál",
+            f"${metrics.get('total_capital', INITIAL_CAPITAL):,.2f}"
+        )
     
     with col3:
-        st.metric("🎯 Win Rate", f"{metrics.get('win_rate', 0):.1f}%")
+        st.metric(
+            "🎯 Win Rate",
+            f"{metrics.get('win_rate', 0):.1f}%",
+            delta=f"{metrics.get('winning_trades', 0)} / {metrics.get('total_trades', 0)}"
+        )
     
-    # Graf
-    st.subheader("📈 Kumulativní P&L")
-    fig = create_simple_chart(df)
-    st.plotly_chart(fig, use_container_width=True)
+    with col4:
+        st.metric(
+            "📉 Max Drawdown",
+            f"${metrics.get('max_drawdown', 0):,.2f}"
+        )
     
-    # Tabulka strategií
-    st.subheader("📋 Přehled strategií")
-    strategy_summary = df.groupby('strategy')['netPL'].agg(['sum', 'count']).round(2)
-    strategy_summary.columns = ['Celkový P&L', 'Počet obchodů']
-    st.dataframe(strategy_summary)
+    # Tabs
+    tab1, tab2 = st.tabs(["📈 Portfolio Overview", "📊 Strategie"])
+    
+    with tab1:
+        # Graf
+        st.subheader("📈 Kumulativní P&L")
+        fig1 = create_cumulative_pl_chart(filtered_df)
+        st.plotly_chart(fig1, use_container_width=True)
+        
+        # Statistiky
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📊 Trading Statistics")
+            st.write(f"**Celkem obchodů:** {metrics.get('total_trades', 0)}")
+            st.write(f"**Winning trades:** {metrics.get('winning_trades', 0)}")
+            st.write(f"**Losing trades:** {metrics.get('losing_trades', 0)}")
+            st.write(f"**Win Rate:** {metrics.get('win_rate', 0):.2f}%")
+        
+        with col2:
+            st.subheader("⚖️ Risk Metrics")
+            st.write(f"**Průměrný zisk:** ${metrics.get('avg_win', 0):.2f}")
+            st.write(f"**Průměrná ztráta:** ${metrics.get('avg_loss', 0):.2f}")
+            st.write(f"**Profit Factor:** {metrics.get('profit_factor', 0):.2f}")
+            st.write(f"**Max Drawdown:** ${metrics.get('max_drawdown', 0):.2f}")
+    
+    with tab2:
+        st.subheader("Výkonnost jednotlivých strategií")
+        
+        strategy_metrics = calculate_strategy_metrics(filtered_df)
+        
+        # Tabulka strategií
+        strategy_summary = []
+        for strategy, metrics_dict in strategy_metrics.items():
+            strategy_summary.append({
+                'Strategie': strategy,
+                'P&L (USD)': f"${metrics_dict['total_pl']:,.2f}",
+                'P&L (%)': f"{metrics_dict['total_pl_percent']:.2f}%",
+                'Obchody': metrics_dict['total_trades'],
+                'Win Rate': f"{metrics_dict['win_rate']:.1f}%",
+                'Profit Factor': f"{metrics_dict['profit_factor']:.2f}"
+            })
+        
+        strategy_df = pd.DataFrame(strategy_summary)
+        st.dataframe(strategy_df, use_container_width=True)
+        
+        # Graf porovnání strategií
+        st.subheader("📊 Porovnání strategií")
+        fig2 = create_strategy_comparison_chart(filtered_df)
+        st.plotly_chart(fig2, use_container_width=True)
+    
+    # Footer
+    st.sidebar.markdown("---")
+    st.sidebar.info(f"📊 Dashboard pro analýzu {len(df)} obchodů")
+    st.sidebar.info(f"💰 Počáteční kapitál: ${INITIAL_CAPITAL:,}")
 
 if __name__ == "__main__":
     main()
