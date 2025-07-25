@@ -118,16 +118,30 @@ def load_sqlite_from_drive(file_id):
         return pd.DataFrame()
 
 def load_excel_from_drive(file_id):
-    """Načte Excel z Google Drive"""
+    """Načte Excel z Google Drive nebo Google Sheets"""
     try:
-        excel_content = download_from_google_drive(file_id, "Excel")
+        # Zkusit Google Sheets API export
+        sheets_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
         
-        if not excel_content:
-            return pd.DataFrame()
-        
-        # Načíst Excel z bytes
-        excel_file = io.BytesIO(excel_content)
-        excel_data = pd.read_excel(excel_file, sheet_name=None)
+        try:
+            response = requests.get(sheets_url, timeout=30)
+            if response.status_code == 200 and len(response.content) > 1000:
+                st.info("📊 Načítám z Google Sheets...")
+                excel_file = io.BytesIO(response.content)
+                excel_data = pd.read_excel(excel_file, sheet_name=None)
+            else:
+                raise Exception("Google Sheets export failed")
+        except:
+            # Fallback na běžný Google Drive download
+            st.info("📁 Načítám z Google Drive...")
+            excel_content = download_from_google_drive(file_id, "Excel")
+            
+            if not excel_content:
+                return pd.DataFrame()
+            
+            # Načíst Excel z bytes
+            excel_file = io.BytesIO(excel_content)
+            excel_data = pd.read_excel(excel_file, sheet_name=None)
         
         combined_data = pd.DataFrame()
         
